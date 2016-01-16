@@ -1,0 +1,447 @@
+---
+title: "Data Science Word Prediction - Capstone Report"
+author: "Jay Urbain"
+date: "December 31, 2016"
+output: html_document
+---
+
+Exploratory analysis and goals for the SwiftKey predictive text mining algorithm and app. This document reviews the major features of the data, and summarizes plans for creating a next word prediction algorithm and Shiny app. Tables and plots are used to illustrate important properties and summarize the data set. 
+
+### The Heio Data Set
+
+The data is taken from the [HC Corpora](http://www.corpora.heliohost.org/aboutcorpus.html), and consists blogs, news and twitter items in German, Danish, Spanish, and English. In this analysis, we only consider English (en_US).
+
+Blog sample (English):
+
+**In the years thereafter, most of the Oil fields and platforms were named after pagan “gods”.
+
+We love you Mr. Brown.**
+
+News sample:
+
+**He wasn't home alone, apparently.
+
+The St. Louis plant had to close. It would die of old age. Workers had been making cars there since the onset of mass automotive production in the 1920s.**
+
+Twitter sample:
+
+**How are you? Btw thanks for the RT. You gonna be in DC anytime soon? Love to see you. Been way, way too long.
+
+When you meet someone special... you'll know. Your heart will beat more rapidly and you'll smile for no reason.**
+
+```{r setOptions, message=FALSE, echo=FALSE, warning=FALSE}
+# Load required libraries
+# 
+# install.packages("tm")
+# install.packages("RWeka")
+# install.packages("SnowballC")
+# install.packages("openNLP")
+# 
+# install.packages("stringi")
+# install.packages("reshape2")
+# install.packages("qdap")
+# install.packages("wordcloud")
+# install.packages("googleVis")
+
+library(tm)
+library(RWeka)
+library(SnowballC)
+library(openNLP)
+library(stringi)
+library(reshape2)
+library(qdap)
+library(wordcloud)
+library(ggplot2)
+library(slam)
+```
+
+##Load English blog, news, and tweet data
+
+```{r loadData, echo=FALSE, warning=FALSE}
+
+setwd("/Users/jayurbain/Dropbox/Coursera/Data Science Capstone")
+
+# Download and unzip the data
+if (!file.exists("Coursera-SwiftKey.zip")) {
+  download.file("https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip")
+  unzip("Coursera-SwiftKey.zip")
+}
+
+#load EN US blogs
+text_en_us_blogs <- readLines("final/en_US/en_US.blogs.txt",encoding="UTF-8")
+paste("en_US.blogs.txt length: ", length(text_en_us_blogs))
+#load EN US news
+text_en_us_news <- readLines("final/en_US/en_US.news.txt",encoding="UTF-8")
+paste("en_US.news.txt length: ", length(text_en_us_news))
+#load EN US twitter
+text_en_us_twitter <- readLines("final/en_US/en_US.twitter.txt",encoding="UTF-8")
+paste("en_US.twitter.txt length: ", length(text_en_us_twitter))
+```
+
+### Summary of English blogs, news, and tweets data:
+
+- File size, number of lines, total number of words, and mean number of words per line.
+
+```{r recho=FALSE}
+df_dataSource <- as.data.frame(
+  c("en_US.news.txt", "en_US.blogs.txt", "en_US.twitter.txt"))
+df_dataSource$fileSizeBytes <- c(
+    file.info("final/en_US/en_US.blogs.txt")$size/(1024^2),
+    file.info("final/en_US/en_US.news.txt")$size/(1024^2),
+    file.info("final/en_US/en_US.twitter.txt")$size/(1024^2))
+df_dataSource$numberLines <- c(
+    length(text_en_us_blogs),
+    length(text_en_us_news),
+    length(text_en_us_twitter))
+df_dataSource$numberWords <- c(
+    length(unlist(stri_extract_all_words(text_en_us_blogs))),
+    length(unlist(stri_extract_all_words(text_en_us_news))),
+    length(unlist(stri_extract_all_words(text_en_us_twitter))))
+df_dataSource$mean_character_per_line <- c(
+    mean(stri_count_words(text_en_us_blogs)),
+    mean(stri_count_words(text_en_us_news)),
+    mean(stri_count_words(text_en_us_twitter)))
+
+colnames(df_dataSource) <- c(
+    "File",
+    "Size_MBytes",
+    "Num_lines",
+    "Num_words",
+    "Mean_words")
+
+df_dataSource
+```
+
+### Create sample data set 
+```{r}
+samplePercent<-0.10
+
+set.seed(123)
+dataSample <- c(
+  sample(text_en_us_blogs, length(text_en_us_blogs)*samplePercent),
+  sample(text_en_us_news, length(text_en_us_news)*samplePercent),
+  sample(text_en_us_twitter, length(text_en_us_twitter)*samplePercent))
+```
+
+### Clean and pre-process the data. 
+
+Create a *Corpus* data structure and perform the following preprocessing:
+
+- Remove punctuation and special characters
+
+- Remove whitespace
+
+- Remove numbers
+
+- Set text to lower case
+
+- Perform lexical stemming on each word
+
+- Remove stop words
+
+```{r}
+makeCorpus <- function(s, stop=FALSE) {
+    c <- VCorpus(VectorSource(s))
+    c <- tm_map(c, removePunctuation)
+    c <- tm_map(c, removeNumbers)
+    c <- tm_map(c, content_transformer(tolower))
+#     if( stop == TRUE ) {
+#       c <- tm_map(c, removeWords, stopwords("en"))
+#     }
+    # c <- tm_map(c, stemDocument) 
+    c <- tm_map(c, stripWhitespace)
+    c <- tm_map(c, PlainTextDocument)
+return(c)
+}
+
+dataCorpus <- makeCorpus(dataSample, FALSE)
+save(dataCorpus, file="dataCorpus.RData")
+#dataCorpusWithOutStop <- makeCorpus(dataSample, TRUE)
+```
+
+### Create unigram, bigram, & trigram term-document matrices:
+
+- Sorted in descending order for frequency analysis.
+```{r}
+# tokenizer models
+uniGram <- function(x) NGramTokenizer(x, Weka_control(min=1, max=1))
+biGram  <- function(x) NGramTokenizer(x, Weka_control(min=2, max=2))
+triGram <- function(x) NGramTokenizer(x, Weka_control(min=3, max=3))
+quadGram <- function(x) NGramTokenizer(x, Weka_control(min=4, max=4))
+
+# term-document matrix for corpus with stop, sparse terms removed
+options(mc.cores=1)
+# term-document matrix for corpus without stop, sparse terms removed
+tdm_uniGram <- removeSparseTerms(
+  TermDocumentMatrix(dataCorpus, control=list(tokenize=uniGram)), 0.9999)
+save(tdm_uniGram, file="tdm_uniGram.RData")
+
+tdm_biGram <- removeSparseTerms( 
+  TermDocumentMatrix(dataCorpus, control=list(tokenize=biGram)), 0.9999)
+save(tdm_biGram, file="tdm_biGram.RData")
+
+tdm_triGram <- removeSparseTerms( 
+  TermDocumentMatrix(dataCorpus, control=list(tokenize=triGram)), 0.9999)
+save(tdm_triGram, file="tdm_triGram.RData")
+
+tdm_quadGram <- removeSparseTerms( 
+  TermDocumentMatrix(dataCorpus, control = list(tokenize = quadGram)), 0.9999)
+save(tdm_quadGram, file="tdm_quadGram.RData")
+
+# inspect(tdm_uniGram[100:120,1:5])
+# inspect(tdm_biGram[100:120,1:5])
+# inspect(tdm_triGram[100:120,1:5])
+# inspect(tdm_quadGram[100:120,1:5])
+# 
+# m_uniGram_sum <-sort(rowSums(as.matrix(tdm_uniGram), na.rm=TRUE), decreasing = TRUE)
+# m_biGram_sum  <-sort(rowSums(as.matrix(tdm_biGram), na.rm=TRUE), decreasing = TRUE)
+# m_triGram_sum <-sort(rowSums(as.matrix(tdm_triGram), na.rm=TRUE), decreasing = TRUE)
+# m_quadGram_sum<-sort(rowSums(as.matrix(tdm_quadGram), na.rm=TRUE), decreasing = TRUE)
+
+# use slam package rollup for better sparse matrix efficiency
+tdm_uniGramCount <- rollup(tdm_uniGram, 2, na.rm=TRUE, FUN = sum)
+tdm_biGramCount <- rollup(tdm_biGram, 2, na.rm=TRUE, FUN = sum)
+tdm_triGramCount <- rollup(tdm_triGram, 2, na.rm=TRUE, FUN = sum)
+tdm_quadGramCount <- rollup(tdm_quadGram, 2, na.rm=TRUE, FUN = sum)
+
+inspect(tdm_uniGramCount)
+inspect(tdm_biGramCount)
+inspect(tdm_triGramCount)
+inspect(tdm_quadGramCount)
+
+# create df with unigram stats 
+v<-as.matrix(tdm_uniGramCount)
+uniGram_totalCount<-sum(v)
+df_uniGram<-as.data.frame(v)
+colnames(df_uniGram)<-c("count")
+df_uniGram$p<-df_uniGram$count/uniGram_totalCount
+df_uniGram<-df_uniGram[with(df_uniGram, order(p, decreasing=T)),]
+save(df_uniGram, file="df_uniGram.RData")
+df_uniGram['friend','count']
+
+head(df_uniGram)
+summary(df_uniGram)
+names(df_uniGram)
+rownames(df_uniGram)
+
+# create df with bigram stats 
+v<-as.matrix(tdm_biGramCount)
+biGram_totalCount<-sum(v)
+df_biGram<-as.data.frame(v)
+colnames(df_biGram)<-c("count")
+df_biGram$p<-df_biGram$count/biGram_totalCount
+df_biGram<-df_biGram[with(df_biGram, order(p, decreasing=T)),]
+save(df_biGram, file="df_biGram.RData")
+
+df_biGram[1:20,]
+
+# create df with trigram stats 
+v<-as.matrix(tdm_triGramCount)
+triGram_totalCount<-sum(v)
+df_triGram<-as.data.frame(v)
+colnames(df_triGram)<-c("count")
+df_triGram$p<-df_triGram$count/triGram_totalCount
+df_triGram<-df_triGram[with(df_triGram, order(p, decreasing=T)),]
+save(df_triGram, file="df_triGram.RData")
+
+df_triGram[1:20,]
+
+# create df with quadgram stats 
+v<-as.matrix(tdm_quadGramCount)
+quadGram_totalCount<-sum(v)
+df_quadGram<-as.data.frame(v)
+colnames(df_quadGram)<-c("count")
+df_quadGram$p<-df_quadGram$count/quadGram_totalCount
+df_quadGram<-df_quadGram[with(df_quadGram, order(p, decreasing=T)),]
+save(df_quadGram, file="df_quadGram.RData")
+
+df_quadGram[1:20,]
+df_quadGram[ grep('you want to', rownames(df_quadGram)), ]
+
+length(df_biGram[,1])
+length(df_triGram[,1])
+length(df_quadGram[,1])
+
+# experiments
+load('df_uniGram.RData',.GlobalEnv)
+load('df_biGram.RData',.GlobalEnv)
+load('df_triGram.RData',.GlobalEnv)
+load('df_quadGram.RData',.GlobalEnv)
+
+load('tdm_uniGram.RData',.GlobalEnv)
+load('tdm_biGram.RData',.GlobalEnv)
+load('tdm_triGram.RData',.GlobalEnv)
+load('tdm_quadGram.RData',.GlobalEnv)
+
+# experiment quadgram
+s<-paste('^', 'you want to', sep='')
+ngrams<-df_quadGram[ grep(s, rownames(df_quadGram)), ]
+ngrams<-ngrams[with(ngrams, order(p, decreasing=T)),]
+ngrams
+
+ngrams$countTotal<-0
+for ( ngram in rownames(ngrams) ) {
+  print(ngram)
+  ngrams[ngram,'countTotal']<-dim(df_quadGram[ grep(paste0(word(ngram, 4), '$'), rownames(df_quadGram)), ])[1]
+}
+ngrams$pS<-ngrams$count/ngrams$countTotal
+
+
+# experiment trigram
+s<-paste('^', 'want to', sep='')
+ngrams<-df_triGram[ grep(s, rownames(df_triGram)), ]
+ngrams<-ngrams[with(ngrams, order(p, decreasing=T)),]
+ngrams
+
+# experiment bigram
+s<-paste('^', 'email', sep='')
+ngrams<-df_biGram[ grep(s, rownames(df_biGram)), ]
+ngrams<-ngrams[with(ngrams, order(p, decreasing=T)),]
+ngrams
+
+# experiment unigram
+s<-paste('^', 'to', sep='')
+ngrams<-df_uniGram[ grep(s, rownames(df_uniGram)), ]
+ngrams<-ngrams[with(ngrams, order(p, decreasing=T)),]
+ngrams
+
+source("predict.R")
+
+debug(predictNgramKB)
+undebug(predictNgramKB)
+
+predictions<-predictNgramKB('you want to')
+predictions
+predictions<-predictNgramKB('you want to', sortPS=TRUE)
+predictions
+
+predictions<-predictNgramKB('under the')
+predictions
+predictions<-predictNgramKB('under the', sortPS=TRUE)
+predictions
+
+predictions<-predictNgramKB('under')
+predictions
+predictions<-predictNgramKB('under', sortPS=TRUE)
+predictions
+
+predictions<-predictNgramKB('')
+predictions
+predictions<-predictNgramKB('', sortPS=TRUE)
+predictions
+
+tdm_biGram
+tdm_triGram
+tdm_quadGram
+
+# associations
+library(plyr)
+dat <- llply(txtTdmBi$dimnames$Terms, function(i) findAssocs(txtTdmBi, i, 0.5), .progress = "text" )
+
+
+findAssocs(tdm_uniGram, c("to"), c(0.3))
+inspect(tdm_uniGram)
+
+findAssocs(tdm, c("to"), c(0.2))
+
+
+#kneser-neys smoothing for unigram counts
+# generate unigram count based on how many distinct word each word follows
+
+n<-nrow(df_uniGram)
+df_uniGram$distBigramCount<-NA
+for(i in 1:n) {
+  #print( paste0(' ',rownames(df_uniGram[i,]),'$') )
+  df_uniGram[i,]$distBigramCount<-nrow(df_biGram[ grep( paste0(' ', rownames(df_uniGram[i,]),'$'), rownames(df_biGram)), ]) 
+}
+
+  nrow(df_biGram[ grep( paste0(' ',rownames(df_uniGram[i,]),'$'), rownames(df_biGram)), ])
+  nrow(df_biGram[ grep( paste0(' ',rownames(df_uniGram[i]),'$'), rownames(df_biGram)), ])
+
+  nrow(df_biGram[ grep(' friend$', rownames(df_biGram)), ])
+  
+  nrow(df_biGram[ grep(' because$', rownames(df_biGram)), ])
+
+
+m_uniGramP<-m_uniGram/uniGram_totalSum
+
+# On all builds of R, the maximum length (number of elements) of a vector is 2^31-1, about 2 billion, and on 64-bit builds the size of a block of memory allocated is limited to 2^34-1 bytes (8GB).
+
+m_tdm_uniGram_sum <-sort(as.matrix(tdm_uniGram_sum), decreasing = TRUE)
+m_tdm_biGram_sum  <-sort(as.matrix(tdm_biGram_sum), decreasing = TRUE)
+m_tdm_triGram_sum <-sort(as.matrix(tdm_triGram_sum), decreasing = TRUE)
+m_tdm_quadGram_sum<-sort(as.matrix(tdm_quadGram_sum), decreasing = TRUE)
+
+inspect(tdm_uniGram[1:100, 1])
+v<-findFreqTerms(tdm_uniGram)
+length(v)
+tdm_uniGram_sum[, 1]
+
+inspect(tdm[c("price", "texas"), c("127", "144", "191", "194")])
+inspect(dtm[1:5, 273:276])
+
+######
+
+m_tdm_uniGram_sum[['the']]
+
+
+# Kneser-Ney Smoothing
+d<- 0.75 # discount factor
+v <- c(0.1,0.3,0.4,0.2)
+rownames(v)<- c('hello', 'how', 'are', 'you', 'jay')
+
+          
+```
+
+### Histogram plots for frequent unigrams, bigrams, and trigrams:
+
+```{r echo=FALSE}
+par(mai=c(1.5,0.8,0.8,0.8))
+barplot(head(m_uniGram, n=15), main="Top 15 Unigrams, Stop Words Removed", col="red", las=2)
+  
+
+
+
+
+  barplot(head(biGram_WithOutStopFreq, n=15), main="Top 15 Bigrams, Stop Words Removed", col="red", las=2)
+barplot(head(triGram_WithOutStopFreq, n=15), main="Top 15 Trigrams, Stop Words Removed", col="red", las=2)
+```
+
+## Wordcloud plots for most frequent unigrams, and bigrams:
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+# Wordcloud unigrams without stop words
+wordcloud(names(uniGram_WithOutStopFreq), uniGram_WithOutStopFreq, colors = brewer.pal(6, "Paired"))
+# Wordcloud bigrams without stop words
+wordcloud(names(biGram_WithOutStopFreq), biGram_WithOutStopFreq, colors = brewer.pal(6, "Paired"))
+# Wordcloud trigrams without stop words
+# wordcloud(names(triGram_WithOutStopFreq), triGram_WithOutStopFreq, colors = brewer.pal(6, "Paired"))
+
+```
+
+### Next steps for prediction algorithm and Shiny App
+
+Evaluate different n-gram models for next word prediction:
+
+- Evaluate unigram, bigram, trigram, fourgram language model parameters: with/without stop words, minimum term frequency, and smoothing for applying some probability mass to unseen words.
+
+- Evaluate back-off language model for next word prediction: from the end of the entered phrase, select the next word that maximizes the likelihood of the trailing n-gram. If no matching fourgram, back-off to trigram; if no matching trigram, back-off to bigram; if no matching bigram, back-off to unigram.
+
+- Evaluate Markov chain bigram language model for next word prediction: maximize the likelihood of the entire entered phrase and next word prediction using a sliding window bigram.
+
+N-gram model stretch goals:
+
+- Evaluate weighted unigram, bigram, trigram model, e.g., assign normalized weights to different models based on their overall predictive accuracy.
+
+- Explore contextual models, i.e., use point-wide mutual information, to assign likelihood of co-occurence.
+
+- Explore different n-gram models. For example skip-grams, where word-omissions are tolerated.
+
+Shiny App:
+
+- Text input allowing user to enter a phrase. 
+
+- Bullets to allow user to select n-gram model.
+
+- App will use selected model to predict the most likely next work.
+
